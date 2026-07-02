@@ -1,0 +1,2549 @@
+openapi: 3.1.0
+info:
+  title: MindFlow Sync API
+  description: |
+    MindFlow 个人知识管理系统的云端同步 API。
+
+    **架构原则**：
+    - 本地 SQLite 是真理源，云端是备份和同步中介
+    - 所有写操作先在本地完成，再通过 Sync API 推送到云端
+    - 读操作直接基于本地数据库，云端仅提供增量同步和数据导出
+    - 冲突解决采用 LWW (Last-Writer-Wins) 策略
+
+    **认证方式**：JWT Bearer Token
+    **版本策略**：URL 前缀 `/api/v1/`
+    **分页策略**：Cursor-based 分页（适合增量同步场景）
+  version: 1.0.0
+  contact:
+    name: MindFlow Engineering Team
+    email: engineering@mindflow.io
+
+servers:
+  - url: https://api.mindflow.io/api/v1
+    description: Production
+  - url: https://api-staging.mindflow.io/api/v1
+    description: Staging
+
+# ============================================================
+# Security
+# ============================================================
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT Bearer Token. 通过 Auth 接口获取。
+        Header: Authorization: Bearer <token>
+
+# ============================================================
+# Common Components
+# ============================================================
+
+  parameters:
+    CorrelationId:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+      description: 用于分布式追踪的请求关联 ID
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+      description: 幂等性键，用于确保变更不会重复处理
+
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+      description: 分页游标 (base64 编码的 `change_log.id`)，首次不传
+
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        default: 50
+        maximum: 200
+      description: 单次返回最大条目数
+
+  headers:
+    RateLimit:
+      schema:
+        type: integer
+      description: 当前窗口剩余请求数
+    RateLimitReset:
+      schema:
+        type: integer
+      description: 限流窗口重置的 Unix 时间戳
+
+  schemas:
+    # ==================== Error ====================
+    ApiError:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          description: 机器可读的错误码
+          example: NOT_FOUND
+        message:
+          type: string
+          description: 人类可读的错误描述
+          example: Note not found
+        details:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+                description: 出参字段路径
+              reason:
+                type: string
+                description: 验证失败原因
+          description: 字段级验证错误详情（仅 VALIDATION_ERROR 时返回）
+        requestId:
+          type: string
+          format: uuid
+          description: 请求 ID，用于服务端日志追溯
+
+    # ==================== Cursor Pagination ====================
+    CursorPagination:
+      type: object
+      properties:
+        nextCursor:
+          type: string
+          nullable: true
+          description: 下一页游标，null 表示已无更多数据
+        hasMore:
+          type: boolean
+          description: 是否还有更多数据
+        total:
+          type: integer
+          nullable: true
+          description: 总记录数（仅部分接口返回）
+
+    # ==================== Auth ====================
+    AuthToken:
+      type: object
+      properties:
+        accessToken:
+          type: string
+          description: JWT Access Token，有效期 2 小时
+        refreshToken:
+          type: string
+          description: Refresh Token，有效期 30 天
+        expiresIn:
+          type: integer
+          description: Access Token 过期秒数（7200）
+        tokenType:
+          type: string
+          enum: [Bearer]
+      required:
+        - accessToken
+        - refreshToken
+        - expiresIn
+        - tokenType
+
+    # ==================== User ====================
+    UserProfile:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        email:
+          type: string
+          format: email
+        displayName:
+          type: string
+          nullable: true
+        avatarUrl:
+          type: string
+          format: uri
+          nullable: true
+        subscriptionTier:
+          type: string
+          enum: [free, pro]
+        preferences:
+          type: object
+          description: 用户偏好设置
+          properties:
+            theme:
+              type: string
+              enum: [light, dark, system]
+              default: system
+            defaultNotebookId:
+              type: string
+              format: uuid
+              nullable: true
+            autoSync:
+              type: boolean
+              default: true
+            wifiOnlySync:
+              type: boolean
+              default: false
+            locale:
+              type: string
+              default: zh-CN
+        locale:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    UpdatePreferencesRequest:
+      type: object
+      properties:
+        preferences:
+          type: object
+          description: 需要更新的偏好字段
+
+    # ==================== Note ====================
+    Note:
+      type: object
+      required:
+        - id
+        - title
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        title:
+          type: string
+          maxLength: 500
+          description: 笔记标题
+        body:
+          type: string
+          description: Markdown 正文，应用层限制 50000 字符
+        isDailyNote:
+          type: boolean
+          default: false
+        notebookIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: 所属笔记本 ID 列表
+        tagIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: 标签 ID 列表
+        deviceId:
+          type: string
+          format: uuid
+          readOnly: true
+          description: 最后修改设备
+        syncVersion:
+          type: integer
+          readOnly: true
+          description: 版本号
+        checksum:
+          type: string
+          description: SHA-256 内容校验和
+        isDeleted:
+          type: boolean
+          default: false
+        trashedAt:
+          type: string
+          format: date-time
+          nullable: true
+        deletedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+        syncUpdatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+          description: LWW 裁决时间
+
+    NoteListResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Note'
+        pagination:
+          $ref: '#/components/schemas/CursorPagination'
+
+    CreateNoteRequest:
+      type: object
+      required:
+        - title
+      properties:
+        title:
+          type: string
+          maxLength: 500
+        body:
+          type: string
+          maxLength: 50000
+        isDailyNote:
+          type: boolean
+          default: false
+        notebookIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: 初始所属笔记本
+        tagIds:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: 初始标签
+        deviceId:
+          type: string
+          format: uuid
+          description: 创建设备
+        checksum:
+          type: string
+          description: SHA-256 内容校验和
+        createdAt:
+          type: string
+          format: date-time
+          description: 客户端的创建时间（ISO-8601）
+
+    UpdateNoteRequest:
+      type: object
+      properties:
+        title:
+          type: string
+          maxLength: 500
+        body:
+          type: string
+          maxLength: 50000
+        checksum:
+          type: string
+        deviceId:
+          type: string
+          format: uuid
+        syncVersion:
+          type: integer
+          description: 乐观锁版本号（服务端用于检测冲突）
+
+    # ==================== Notebook ====================
+    Notebook:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        name:
+          type: string
+          maxLength: 200
+        parentId:
+          type: string
+          format: uuid
+          nullable: true
+        sortOrder:
+          type: integer
+          default: 0
+        noteCount:
+          type: integer
+          readOnly: true
+          description: 去规范化笔记计数
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/Notebook'
+          description: 子笔记本（仅树形查询时返回）
+        isDeleted:
+          type: boolean
+          default: false
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    NotebookTreeResponse:
+      type: array
+      items:
+        $ref: '#/components/schemas/Notebook'
+
+    CreateNotebookRequest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          maxLength: 200
+        parentId:
+          type: string
+          format: uuid
+          nullable: true
+        sortOrder:
+          type: integer
+          default: 0
+
+    UpdateNotebookRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          maxLength: 200
+        parentId:
+          type: string
+          format: uuid
+          nullable: true
+        sortOrder:
+          type: integer
+
+    UpdateNotebookSortRequest:
+      type: object
+      required:
+        - sortOrder
+      properties:
+        sortOrder:
+          type: integer
+          description: 新的排序序号
+
+    # ==================== Tag ====================
+    Tag:
+      type: object
+      required:
+        - id
+        - name
+        - path
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        name:
+          type: string
+          maxLength: 100
+          description: 标签名称（末段值，如 "大模型"）
+        path:
+          type: string
+          maxLength: 500
+          description: 完整路径（如 "科技/AI/大模型"）
+        parentId:
+          type: string
+          format: uuid
+          nullable: true
+        noteCount:
+          type: integer
+          readOnly: true
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tag'
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    CreateTagRequest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          maxLength: 100
+        parentId:
+          type: string
+          format: uuid
+          nullable: true
+        path:
+          type: string
+          maxLength: 500
+          description: 不传路径时由服务端自动根据 parentId 构造
+
+    RenameTagRequest:
+      type: object
+      required:
+        - path
+      properties:
+        path:
+          type: string
+          maxLength: 500
+          description: 新的完整路径（如 "科技/大语言模型"）
+
+    MergeTagRequest:
+      type: object
+      required:
+        - targetTagId
+      properties:
+        targetTagId:
+          type: string
+          format: uuid
+          description: 合并到的目标标签 ID
+
+    # ==================== Version History ====================
+    VersionHistory:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        noteId:
+          type: string
+          format: uuid
+        title:
+          type: string
+        versionNumber:
+          type: integer
+        deviceId:
+          type: string
+          format: uuid
+        source:
+          type: string
+          enum: [auto_save, manual, conflict, restore]
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    VersionHistoryDetail:
+      allOf:
+        - $ref: '#/components/schemas/VersionHistory'
+        - type: object
+          properties:
+            body:
+              type: string
+              description: 该版本的完整正文
+
+    # ==================== Search ====================
+    SearchResult:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchResultItem'
+        pagination:
+          $ref: '#/components/schemas/CursorPagination'
+
+    SearchResultItem:
+      type: object
+      properties:
+        noteId:
+          type: string
+          format: uuid
+        title:
+          type: string
+        highlightSnippet:
+          type: string
+          description: 匹配内容的上下文片段（含 <mark> 标签）
+        matchType:
+          type: string
+          enum: [title, body, tag]
+          description: 匹配类型
+        relevance:
+          type: number
+          format: float
+        notebookPath:
+          type: string
+          nullable: true
+        tags:
+          type: array
+          items:
+            type: string
+        updatedAt:
+          type: string
+          format: date-time
+
+    # ==================== Sync ====================
+    SyncPushRequest:
+      type: object
+      required:
+        - deviceId
+        - changes
+      properties:
+        deviceId:
+          type: string
+          format: uuid
+          description: 发起同步的设备 ID
+        changes:
+          type: array
+          items:
+            $ref: '#/components/schemas/SyncChangeEntry'
+          maxItems: 50
+          description: 本地未同步的变更条目（最多 50 条/批）
+        deviceTime:
+          type: string
+          format: date-time
+          description: 设备当前时间，用于时钟偏移检测
+
+    SyncChangeEntry:
+      type: object
+      required:
+        - changeId
+        - entityType
+        - entityId
+        - operation
+        - timestamp
+        - version
+      properties:
+        changeId:
+          type: integer
+          description: 本地 change_log 自增 ID
+        entityType:
+          type: string
+          enum: [note, notebook, tag, notebook_ref, tag_ref]
+        entityId:
+          type: string
+          format: uuid
+        operation:
+          type: string
+          enum: [create, update, delete]
+        timestamp:
+          type: string
+          format: date-time
+          description: 变更发生时的客户端时间
+        deviceId:
+          type: string
+          format: uuid
+        version:
+          type: integer
+          description: 变更后的实体版本号
+        checksum:
+          type: string
+          nullable: true
+        payload:
+          type: object
+          description: 变更数据 JSON 快照（字段因实体类型而异）
+
+    SyncPushResponse:
+      type: object
+      properties:
+        cursor:
+          type: object
+          properties:
+            serverTime:
+              type: string
+              format: date-time
+              description: 服务端当前时间
+            acknowledgedChangeIds:
+              type: array
+              items:
+                type: integer
+              description: 已成功处理的本地 change_log ID 列表
+        conflicts:
+          type: array
+          items:
+            $ref: '#/components/schemas/SyncConflict'
+          description: 冲突条目列表
+        pendingChangesCount:
+          type: integer
+          description: 服务端队列中该用户待拉取的变更数
+
+    SyncConflict:
+      type: object
+      properties:
+        changeId:
+          type: integer
+          description: 冲突对应的本地 change_log ID
+        entityType:
+          type: string
+        entityId:
+          type: string
+          format: uuid
+        localVersion:
+          type: integer
+        remoteVersion:
+          type: integer
+        resolution:
+          type: string
+          enum: [local_wins, remote_wins]
+          description: LWW 裁决结果
+        remoteSnapshot:
+          type: object
+          description: 远程版本数据快照（remote_wins 时返回）
+
+    SyncPullRequest:
+      type: object
+      required:
+        - deviceId
+      properties:
+        deviceId:
+          type: string
+          format: uuid
+        cursor:
+          type: integer
+          description: 上次成功拉取的云端 change_log.id，首次不传
+        limit:
+          type: integer
+          default: 100
+          maximum: 200
+        deviceTime:
+          type: string
+          format: date-time
+          description: 设备当前时间
+
+    SyncPullResponse:
+      type: object
+      properties:
+        changes:
+          type: array
+          items:
+            $ref: '#/components/schemas/SyncChangeEntry'
+        cursor:
+          type: integer
+          description: 新的拉取游标（下次 Pull 时传入）
+        serverTime:
+          type: string
+          format: date-time
+          description: 服务端当前时间
+        hasMore:
+          type: boolean
+
+    # ==================== Device ====================
+    RegisterDeviceRequest:
+      type: object
+      required:
+        - deviceId
+        - deviceName
+        - deviceType
+      properties:
+        deviceId:
+          type: string
+          format: uuid
+          description: 客户端生成的设备 UUID（持久化存储）
+        deviceName:
+          type: string
+          maxLength: 200
+          description: 设备显示名称
+        deviceType:
+          type: string
+          enum: [web, ios, android]
+        fcmToken:
+          type: string
+          nullable: true
+          description: 推送通知 Token（可选）
+
+    DeviceInfo:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        deviceName:
+          type: string
+        deviceType:
+          type: string
+        lastSeenAt:
+          type: string
+          format: date-time
+        isActive:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+
+    # ==================== Export / Import ====================
+    ExportJob:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        status:
+          type: string
+          enum: [pending, processing, completed, failed]
+        progress:
+          type: object
+          properties:
+            total:
+              type: integer
+            processed:
+              type: integer
+            percentage:
+              type: integer
+        downloadUrl:
+          type: string
+          format: uri
+          nullable: true
+          description: 下载链接（status=completed 时返回）
+        expiresAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: 下载链接过期时间
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    ImportJob:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        status:
+          type: string
+          enum: [pending, processing, completed, failed]
+        progress:
+          type: object
+          properties:
+            total:
+              type: integer
+            processed:
+              type: integer
+            failed:
+              type: integer
+            percentage:
+              type: integer
+        report:
+          type: object
+          nullable: true
+          properties:
+            imported:
+              type: integer
+            failed:
+              type: integer
+            skipped:
+              type: integer
+            errors:
+              type: array
+              items:
+                type: object
+                properties:
+                  fileName:
+                    type: string
+                  reason:
+                    type: string
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+  # ============================================================
+  # Common Responses
+  # ============================================================
+  responses:
+    Unauthorized:
+      description: 认证失败（Token 缺失、过期或无效）
+      headers:
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimit'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            code: UNAUTHORIZED
+            message: Valid authentication required
+
+    Forbidden:
+      description: 权限不足
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            code: FORBIDDEN
+            message: Insufficient permissions
+
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            code: NOT_FOUND
+            message: Resource not found
+
+    Conflict:
+      description: 资源冲突
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            code: CONFLICT
+            message: Resource version conflict
+
+    RateLimited:
+      description: 请求过于频繁
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: 建议重试等待秒数
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            code: RATE_LIMITED
+            message: Too many requests
+
+    ValidationError:
+      description: 请求参数验证失败
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+          example:
+            code: VALIDATION_ERROR
+            message: Request validation failed
+            details:
+              - field: title
+                reason: Title is required
+
+# ============================================================
+# Paths
+# ============================================================
+
+paths:
+  # ==================== Health ====================
+  /health:
+    get:
+      operationId: healthCheck
+      summary: 健康检查
+      tags: [System]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 服务健康
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [healthy, degraded, unhealthy]
+                  version:
+                    type: string
+                  uptime:
+                    type: number
+                  timestamp:
+                    type: string
+                    format: date-time
+
+  # ==================== Auth ====================
+  /auth/register:
+    post:
+      operationId: register
+      summary: 用户注册
+      tags: [Auth]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+                  minLength: 8
+                  description: 至少 8 位，需含字母和数字
+                displayName:
+                  type: string
+                  maxLength: 100
+                locale:
+                  type: string
+                  default: zh-CN
+      responses:
+        '201':
+          description: 注册成功，返回 Token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: '#/components/schemas/UserProfile'
+                  tokens:
+                    $ref: '#/components/schemas/AuthToken'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '409':
+          description: 邮箱已被注册
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                code: EMAIL_ALREADY_EXISTS
+                message: This email is already registered
+
+  /auth/login:
+    post:
+      operationId: login
+      summary: 用户登录
+      tags: [Auth]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [email, password]
+                  properties:
+                    email:
+                      type: string
+                      format: email
+                    password:
+                      type: string
+                - type: object
+                  required: [provider, code]
+                  properties:
+                    provider:
+                      type: string
+                      enum: [google, apple]
+                    code:
+                      type: string
+                      description: OAuth 授权码
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: '#/components/schemas/UserProfile'
+                  tokens:
+                    $ref: '#/components/schemas/AuthToken'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '423':
+          description: 账户已锁定
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                code: ACCOUNT_LOCKED
+                message: Account locked due to too many login attempts. Retry after 15 minutes
+
+  /auth/refresh:
+    post:
+      operationId: refreshToken
+      summary: 刷新 Access Token
+      tags: [Auth]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken:
+                  type: string
+      responses:
+        '200':
+          description: Token 刷新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthToken'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/password-reset-request:
+    post:
+      operationId: requestPasswordReset
+      summary: 请求密码重置
+      tags: [Auth]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+                  format: email
+      responses:
+        '200':
+          description: 重置邮件已发送（无论邮箱是否存在）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: If the email is registered, a reset link has been sent
+
+  /auth/password-reset:
+    post:
+      operationId: resetPassword
+      summary: 执行密码重置
+      tags: [Auth]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, newPassword]
+              properties:
+                token:
+                  type: string
+                  description: 重置令牌（从重置链接中获取）
+                newPassword:
+                  type: string
+                  minLength: 8
+      responses:
+        '200':
+          description: 密码重置成功
+        '400':
+          $ref: '#/components/responses/ValidationError'
+
+  /auth/oauth/{provider}:
+    post:
+      operationId: oauthCallback
+      summary: OAuth 登录回调
+      tags: [Auth]
+      security: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [google, apple]
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                redirectUri:
+                  type: string
+                  format: uri
+      responses:
+        '200':
+          description: OAuth 登录成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: '#/components/schemas/UserProfile'
+                  tokens:
+                    $ref: '#/components/schemas/AuthToken'
+                  isNewUser:
+                    type: boolean
+                    description: 是否新注册用户
+
+  # ==================== User ====================
+  /user/profile:
+    get:
+      operationId: getUserProfile
+      summary: 获取用户个人信息
+      tags: [User]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 用户信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    patch:
+      operationId: updateUserProfile
+      summary: 更新用户个人信息
+      tags: [User]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                displayName:
+                  type: string
+                  maxLength: 100
+                avatarUrl:
+                  type: string
+                  format: uri
+                  nullable: true
+                locale:
+                  type: string
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+
+  /user/preferences:
+    patch:
+      operationId: updatePreferences
+      summary: 更新用户偏好设置
+      tags: [User]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePreferencesRequest'
+      responses:
+        '200':
+          description: 偏好设置更新成功
+
+  /user/account:
+    delete:
+      operationId: deleteAccount
+      summary: 删除账户（软删除 + 30 天等待期）
+      tags: [User]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password:
+                  type: string
+                  description: 当前密码（Email 用户）/ OAuth 重新认证
+      responses:
+        '200':
+          description: 账户删除请求已接受
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Account deletion scheduled. Data will be permanently removed in 30 days
+                  scheduledDeletionDate:
+                    type: string
+                    format: date-time
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /user/devices:
+    get:
+      operationId: listDevices
+      summary: 列出用户所有注册设备
+      tags: [User]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 设备列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DeviceInfo'
+
+  /user/devices/{deviceId}:
+    delete:
+      operationId: revokeDevice
+      summary: 吊销设备（从该设备登出）
+      tags: [User]
+      parameters:
+        - name: deviceId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '204':
+          description: 设备已吊销
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ==================== Notes ====================
+  /notes:
+    get:
+      operationId: listNotes
+      summary: 获取笔记列表（支持游标分页和过滤）
+      tags: [Notes]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/CorrelationId'
+        - name: includeDeleted
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: 是否包含已删除笔记
+        - name: notebookId
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: 按笔记本过滤
+        - name: tagId
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: 按标签过滤
+        - name: updatedAfter
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: 过滤在此时间后有更新的笔记（增量同步辅助）
+      responses:
+        '200':
+          description: 笔记列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NoteListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      operationId: createNote
+      summary: 创建笔记
+      tags: [Notes]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateNoteRequest'
+      responses:
+        '201':
+          description: 笔记创建成功
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+              description: 新笔记 URL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Note'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          description: 内容超过限制
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                code: PAYLOAD_TOO_LARGE
+                message: Note body exceeds maximum length of 50000 characters
+
+  /notes/{noteId}:
+    get:
+      operationId: getNote
+      summary: 获取单条笔记详情
+      tags: [Notes]
+      parameters:
+        - name: noteId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 笔记详情
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Note'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      operationId: updateNote
+      summary: 更新笔记内容
+      tags: [Notes]
+      parameters:
+        - name: noteId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateNoteRequest'
+      responses:
+        '200':
+          description: 笔记更新成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Note'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 版本冲突（syncVersion 不匹配）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                code: VERSION_CONFLICT
+                message: Note has been modified by another device. Current version is 7
+
+    delete:
+      operationId: softDeleteNote
+      summary: 软删除笔记（移入回收站）
+      tags: [Notes]
+      parameters:
+        - name: noteId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '204':
+          description: 笔记已移入回收站
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /notes/{noteId}/restore:
+    post:
+      operationId: restoreNote
+      summary: 从回收站恢复笔记
+      tags: [Notes]
+      parameters:
+        - name: noteId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 笔记已恢复
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Note'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /notes/{noteId}/permanent:
+    delete:
+      operationId: permanentlyDeleteNote
+      summary: 永久删除笔记（跳过回收站）
+      tags: [Notes]
+      parameters:
+        - name: noteId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '204':
+          description: 笔记已永久删除
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ==================== Note Notebooks & Tags ====================
+  /notes/{noteId}/notebooks:
+    put:
+      operationId: setNoteNotebooks
+      summary: 设置笔记所属笔记本列表
+      tags: [Notes]
+      parameters:
+        - name: noteId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [notebookIds]
+              properties:
+                notebookIds:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+      responses:
+        '200':
+          description: 笔记本列表已更新
+
+  /notes/{noteId}/tags:
+    put:
+      operationId: setNoteTags
+      summary: 设置笔记的标签列表
+      tags: [Notes]
+      parameters:
+        - name: noteId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tagIds]
+              properties:
+                tagIds:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+      responses:
+        '200':
+          description: 标签列表已更新
+
+  # ==================== Version History ====================
+  /notes/{noteId}/versions:
+    get:
+      operationId: listNoteVersions
+      summary: 获取笔记版本历史列表
+      tags: [Notes]
+      parameters:
+        - name: noteId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 版本历史列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/VersionHistory'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /notes/{noteId}/versions/{versionId}:
+    get:
+      operationId: getNoteVersionDetail
+      summary: 获取某个历史版本的完整内容
+      tags: [Notes]
+      parameters:
+        - name: noteId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: versionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 版本详情（含完整正文）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionHistoryDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /notes/{noteId}/versions/{versionId}/restore:
+    post:
+      operationId: restoreNoteVersion
+      summary: 恢复到指定历史版本
+      tags: [Notes]
+      parameters:
+        - name: noteId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: versionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 版本已恢复
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Note'
+
+  # ==================== Notebooks ====================
+  /notebooks:
+    get:
+      operationId: listNotebookTree
+      summary: 获取笔记本树形结构
+      tags: [Notebooks]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 树形笔记本列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotebookTreeResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      operationId: createNotebook
+      summary: 创建笔记本/文件夹
+      tags: [Notebooks]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateNotebookRequest'
+      responses:
+        '201':
+          description: 笔记本创建成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Notebook'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /notebooks/{notebookId}:
+    get:
+      operationId: getNotebook
+      summary: 获取笔记本详情
+      tags: [Notebooks]
+      parameters:
+        - name: notebookId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 笔记本详情
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Notebook'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      operationId: updateNotebook
+      summary: 更新笔记本信息（名称、父级、排序）
+      tags: [Notebooks]
+      parameters:
+        - name: notebookId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateNotebookRequest'
+      responses:
+        '200':
+          description: 笔记本更新成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Notebook'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      operationId: deleteNotebook
+      summary: 删除笔记本
+      tags: [Notebooks]
+      parameters:
+        - name: notebookId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: cascade
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: true = 同时删除其中的笔记；false = 笔记保留到未分类
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '204':
+          description: 笔记本已删除
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /notebooks/{notebookId}/sort:
+    put:
+      operationId: updateNotebookSort
+      summary: 更新同级笔记本排序
+      tags: [Notebooks]
+      parameters:
+        - name: notebookId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateNotebookSortRequest'
+      responses:
+        '200':
+          description: 排序已更新
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ==================== Tags ====================
+  /tags:
+    get:
+      operationId: listTagTree
+      summary: 获取标签树形结构
+      tags: [Tags]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 树形标签列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Tag'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      operationId: createTag
+      summary: 创建标签
+      tags: [Tags]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTagRequest'
+      responses:
+        '201':
+          description: 标签创建成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Tag'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: 标签路径已存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                code: TAG_PATH_EXISTS
+                message: Tag path already exists
+
+  /tags/{tagId}:
+    get:
+      operationId: getTag
+      summary: 获取标签详情
+      tags: [Tags]
+      parameters:
+        - name: tagId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 标签详情
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Tag'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      operationId: renameTag
+      summary: 重命名标签（全局更新所有关联笔记的标签引用）
+      tags: [Tags]
+      parameters:
+        - name: tagId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenameTagRequest'
+      responses:
+        '200':
+          description: 标签重命名成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/Tag'
+                  affectedNotes:
+                    type: integer
+                    description: 受影响的笔记数量
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 新路径与已有标签冲突
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                code: TAG_PATH_CONFLICT
+                message: Target path already exists
+
+    delete:
+      operationId: deleteTag
+      summary: 删除标签（仅删除标签本身，不影响笔记）
+      tags: [Tags]
+      parameters:
+        - name: tagId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '204':
+          description: 标签已删除
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /tags/{tagId}/merge:
+    post:
+      operationId: mergeTag
+      summary: 合并标签（将源标签合并到目标标签）
+      tags: [Tags]
+      parameters:
+        - name: tagId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: 被合并的源标签
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MergeTagRequest'
+      responses:
+        '200':
+          description: 标签合并成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  targetTag:
+                    $ref: '#/components/schemas/Tag'
+                  affectedNotes:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ==================== Search ====================
+  /search:
+    get:
+      operationId: searchNotes
+      summary: 服务端搜索（作为本地搜索的补充，仅返回索引数据）
+      tags: [Search]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/CorrelationId'
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+          description: 搜索关键词
+        - name: tag
+          in: query
+          schema:
+            type: string
+          description: 按标签路径过滤
+        - name: notebookId
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: 按笔记本过滤
+        - name: updatedAfter
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: 按更新时间过滤
+        - name: updatedBefore
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: 按更新时间过滤（上限）
+      responses:
+        '200':
+          description: 搜索结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResult'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ==================== Sync ====================
+  /sync/register-device:
+    post:
+      operationId: registerDevice
+      summary: 注册设备（首次同步前必须调用）
+      tags: [Sync]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterDeviceRequest'
+      responses:
+        '200':
+          description: 设备注册/确认成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  device:
+                    $ref: '#/components/schemas/DeviceInfo'
+                  serverTime:
+                    type: string
+                    format: date-time
+                    description: 服务端当前时间（客户端用于时钟偏移校准）
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: 设备 ID 已被其他用户注册
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                code: DEVICE_ALREADY_REGISTERED
+                message: Device already registered to another user
+
+  /sync/push:
+    post:
+      operationId: syncPush
+      summary: 推送本地变更到云端
+      tags: [Sync]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SyncPushRequest'
+      responses:
+        '200':
+          description: 变更处理完成
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncPushResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+
+  /sync/pull:
+    post:
+      operationId: syncPull
+      summary: 从云端拉取其他设备的变更
+      tags: [Sync]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SyncPullRequest'
+      responses:
+        '200':
+          description: 成功拉取变更
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncPullResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ==================== Export ====================
+  /export:
+    post:
+      operationId: startExport
+      summary: 发起全量数据导出任务
+      tags: [Export]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                format:
+                  type: string
+                  enum: [markdown_json, zip]
+                  default: zip
+                includeAttachments:
+                  type: boolean
+                  default: false
+                  description: 是否包含附件（MVP 阶段暂不支持）
+      responses:
+        '202':
+          description: 导出任务已创建
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportJob'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /export/{jobId}:
+    get:
+      operationId: getExportStatus
+      summary: 查询导出任务进度
+      tags: [Export]
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 导出任务状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExportJob'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /export/{jobId}/download:
+    get:
+      operationId: downloadExport
+      summary: 下载导出文件
+      tags: [Export]
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 导出文件下载
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          description: 下载链接已过期
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                code: DOWNLOAD_EXPIRED
+                message: Download link has expired. Please start a new export
+
+  # ==================== Import ====================
+  /import:
+    post:
+      operationId: startImport
+      summary: 发起数据导入任务
+      tags: [Import]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [source, files]
+              properties:
+                source:
+                  type: string
+                  enum: [markdown, obsidian, apple_notes]
+                files:
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+                  description: 上传的文件（.md 文件或 ZIP 压缩包）
+                onConflict:
+                  type: string
+                  enum: [rename, skip, overwrite]
+                  default: rename
+                  description: 重名笔记处理策略
+                targetNotebookId:
+                  type: string
+                  format: uuid
+                  nullable: true
+                  description: 导入到指定笔记本（null = 不归类）
+      responses:
+        '202':
+          description: 导入任务已创建
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportJob'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          description: 上传文件过大（单次导入最大 100MB）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+              example:
+                code: PAYLOAD_TOO_LARGE
+                message: Total import file size exceeds maximum of 100MB
+
+  /import/{jobId}:
+    get:
+      operationId: getImportStatus
+      summary: 查询导入任务进度
+      tags: [Import]
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 导入任务状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportJob'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /import/{jobId}/logs:
+    get:
+      operationId: getImportLogs
+      summary: 获取导入任务详细日志
+      tags: [Import]
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 导入日志
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  logs:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        fileName:
+                          type: string
+                        status:
+                          type: string
+                          enum: [success, skipped, failed]
+                        reason:
+                          type: string
+                          nullable: true
+                        noteId:
+                          type: string
+                          format: uuid
+                          nullable: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ==================== Trash / Recycle Bin ====================
+  /trash/notes:
+    get:
+      operationId: listTrashedNotes
+      summary: 获取回收站中的笔记列表
+      tags: [Trash]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 回收站笔记列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NoteListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /trash/notes/empty:
+    post:
+      operationId: emptyTrash
+      summary: 清空回收站（永久删除所有回收站中的笔记）
+      tags: [Trash]
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: 回收站已清空
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+# ============================================================
+# Error Codes Reference
+# ============================================================
+
+x-error-codes:
+  - code: VALIDATION_ERROR
+    httpStatus: 400
+    description: 请求参数验证失败
+
+  - code: UNAUTHORIZED
+    httpStatus: 401
+    description: 缺少或无效的认证凭据
+
+  - code: FORBIDDEN
+    httpStatus: 403
+    description: 权限不足（如免费版用户尝试 Pro 功能）
+
+  - code: NOT_FOUND
+    httpStatus: 404
+    description: 请求的资源不存在
+
+  - code: CONFLICT
+    httpStatus: 409
+    description: 资源冲突（如版本不匹配、数据重复）
+
+  - code: VERSION_CONFLICT
+    httpStatus: 409
+    description: 笔记版本冲突（不同设备同时编辑）
+
+  - code: EMAIL_ALREADY_EXISTS
+    httpStatus: 409
+    description: 注册邮箱已被使用
+
+  - code: TAG_PATH_EXISTS
+    httpStatus: 409
+    description: 标签路径已存在
+
+  - code: TAG_PATH_CONFLICT
+    httpStatus: 409
+    description: 标签路径冲突（重命名/合并时）
+
+  - code: DEVICE_ALREADY_REGISTERED
+    httpStatus: 409
+    description: 设备已被其他用户注册
+
+  - code: ACCOUNT_LOCKED
+    httpStatus: 423
+    description: 账户已锁定（多次登录失败）
+
+  - code: RATE_LIMITED
+    httpStatus: 429
+    description: 请求频率超过限制
+
+  - code: PAYLOAD_TOO_LARGE
+    httpStatus: 413
+    description: 请求体太大（笔记超限、文件超限）
+
+  - code: QUOTA_EXCEEDED
+    httpStatus: 403
+    description: 免费版配额超限（笔记数、笔记本数等）
+
+  - code: DOWNLOAD_EXPIRED
+    httpStatus: 410
+    description: 下载链接已过期
+
+  - code: INTERNAL_ERROR
+    httpStatus: 500
+    description: 服务端内部错误
