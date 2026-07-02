@@ -1,0 +1,406 @@
+openapi: 3.1.0
+info:
+  title: {{PROJECT_NAME}} API
+  description: |
+    {{DESCRIPTION}}
+  version: 1.0.0
+  contact:
+    name: {{TEAM_NAME}}
+    email: {{TEAM_EMAIL}}
+
+servers:
+  - url: https://api.{{domain}}.com/v1
+    description: Production
+  - url: https://api-staging.{{domain}}.com/v1
+    description: Staging
+
+# ============================================================
+# Security
+# ============================================================
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT Bearer Token.
+        Header: Authorization: Bearer <token>
+
+# ============================================================
+# Common Components
+# ============================================================
+
+  schemas:
+    # --- Error ---
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          description: Machine-readable error code
+          example: NOT_FOUND
+        message:
+          type: string
+          description: Human-readable error message
+          example: Resource not found
+        details:
+          type: array
+          items:
+            type: object
+          description: Field-level validation details
+
+    # --- Pagination ---
+    Pagination:
+      type: object
+      properties:
+        total:
+          type: integer
+          description: Total record count
+        limit:
+          type: integer
+          default: 20
+          maximum: 100
+        offset:
+          type: integer
+          default: 0
+        hasMore:
+          type: boolean
+          description: Whether more records exist
+
+    # --- Sort ---
+    SortOrder:
+      type: string
+      enum: [asc, desc]
+
+  # --- Common Parameters ---
+  parameters:
+    CorrelationId:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+      description: For distributed tracing
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema:
+        type: string
+        format: uuid
+      description: For idempotent mutation requests
+
+    PaginationLimit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        default: 20
+        maximum: 100
+
+    PaginationOffset:
+      name: offset
+      in: query
+      required: false
+      schema:
+        type: integer
+        default: 0
+
+  # --- Common Responses ---
+  responses:
+    Unauthorized:
+      description: Missing or invalid credentials
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: UNAUTHORIZED
+            message: Valid authentication required
+
+    Forbidden:
+      description: Insufficient permissions
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: FORBIDDEN
+            message: Insufficient permissions
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: NOT_FOUND
+            message: Resource not found
+
+    RateLimited:
+      description: Too many requests
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds until retry
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: RATE_LIMITED
+            message: Too many requests, retry after 60s
+
+# ============================================================
+# Paths: {{ENTITY_A}}
+# ============================================================
+
+paths:
+  /{{entity_As}}:
+    get:
+      operationId: list{{EntityA}}s
+      summary: List {{EntityA}}s
+      description: Returns a paginated list of {{EntityA}}s with optional filtering
+      tags: [{{EntityA}}s]
+      security:
+        - bearerAuth: [{{scope}}:read]
+      parameters:
+        - $ref: '#/components/parameters/PaginationLimit'
+        - $ref: '#/components/parameters/PaginationOffset'
+        - $ref: '#/components/parameters/CorrelationId'
+        - name: status
+          in: query
+          schema:
+            type: string
+          description: Filter by status
+        - name: sort
+          in: query
+          schema:
+            $ref: '#/components/schemas/SortOrder'
+          description: Sort by created_at
+      responses:
+        '200':
+          description: Paginated list of {{EntityA}}s
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/{{EntityA}}'
+                  pagination:
+                    $ref: '#/components/schemas/Pagination'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    post:
+      operationId: create{{EntityA}}
+      summary: Create {{EntityA}}
+      tags: [{{EntityA}}s]
+      security:
+        - bearerAuth: [{{scope}}:write]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Create{{EntityA}}Request'
+      responses:
+        '201':
+          description: {{EntityA}} created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/{{EntityA}}'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Conflict (duplicate)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /{{entity_As}}/{{id}}:
+    get:
+      operationId: get{{EntityA}}
+      summary: Get {{EntityA}} by ID
+      tags: [{{EntityA}}s]
+      security:
+        - bearerAuth: [{{scope}}:read]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '200':
+          description: {{EntityA}} found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: '#/components/schemas/{{EntityA}}'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      operationId: update{{EntityA}}
+      summary: Update {{EntityA}}
+      tags: [{{EntityA}}s]
+      security:
+        - bearerAuth: [{{scope}}:write]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Update{{EntityA}}Request'
+      responses:
+        '200':
+          description: {{EntityA}} updated
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      operationId: delete{{EntityA}}
+      summary: Delete {{EntityA}}
+      tags: [{{EntityA}}s]
+      security:
+        - bearerAuth: [{{scope}}:write]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/CorrelationId'
+      responses:
+        '204':
+          description: {{EntityA}} deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+# ============================================================
+# Entities: Schemas (move to components/schemas)
+# ============================================================
+
+  schemas:
+    {{EntityA}}:
+      type: object
+      required:
+        - id
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+          description: Unique identifier
+        # --- business fields ---
+        {{field}}:
+          type: {{string | integer | boolean | ...}}
+          description: {{DESCRIPTION}}
+          example: {{EXAMPLE}}
+        # --- timestamps ---
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    Create{{EntityA}}Request:
+      type: object
+      required:
+        - {{field}}
+      properties:
+        {{field}}:
+          type: {{string | integer | ...}}
+          description: {{DESCRIPTION}}
+
+    Update{{EntityA}}Request:
+      type: object
+      properties:
+        {{field}}:
+          type: {{string | integer | ...}}
+          description: {{DESCRIPTION}}
+
+# ============================================================
+# Health
+# ============================================================
+
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Health check
+      tags: [System]
+      security: []
+      responses:
+        '200':
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [healthy, degraded, unhealthy]
+                  version:
+                    type: string
+                  uptime:
+                    type: number

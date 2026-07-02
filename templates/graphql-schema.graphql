@@ -1,0 +1,210 @@
+# {{PROJECT_NAME}} GraphQL Schema
+# GraphQL Endpoint: {{https://api.example.com/graphql}}
+
+# ============================================================
+# Scalars
+# ============================================================
+
+scalar DateTime
+scalar JSON
+scalar UUID
+
+# ============================================================
+# Enums
+# ============================================================
+
+enum SortOrder {
+  ASC
+  DESC
+}
+
+# ============================================================
+# Interfaces
+# ============================================================
+
+interface Node {
+  id: ID!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+interface Connection {
+  totalCount: Int!
+  pageInfo: PageInfo!
+}
+
+# ============================================================
+# Types
+# ============================================================
+
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+
+# --- {{ENTITY_A}}
+
+type {{EntityA}} implements Node {
+  id: ID!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+
+  # fields
+  {{field}}: {{Type}}!
+
+  # relations
+  {{entityBs}}(first: Int, after: String, last: Int, before: String): {{EntityA}}To{{EntityB}}Connection!
+}
+
+type {{EntityA}}Edge {
+  node: {{EntityA}}!
+  cursor: String!
+}
+
+type {{EntityA}}Connection implements Connection {
+  edges: [{{EntityA}}Edge!]!
+  totalCount: Int!
+  pageInfo: PageInfo!
+}
+
+# --- {{ENTITY_B}}
+
+type {{EntityB}} implements Node {
+  id: ID!
+
+  # fields
+  {{field}}: {{Type}}!
+
+  # relations
+  {{entityA}}: {{EntityA}}!
+
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+# ============================================================
+# Inputs
+# ============================================================
+
+input Create{{EntityA}}Input {
+  {{field}}: {{Type}}!
+}
+
+input Update{{EntityA}}Input {
+  {{field}}: {{Type}}
+}
+
+input {{EntityA}}Filter {
+  {{field}}: StringFilter
+  createdAt: DateTimeRange
+  and: [{{EntityA}}Filter!]
+  or: [{{EntityA}}Filter!]
+}
+
+input StringFilter {
+  eq: String
+  neq: String
+  contains: String
+  startsWith: String
+  endsWith: String
+  in: [String!]
+}
+
+input DateTimeRange {
+  gte: DateTime
+  lte: DateTime
+}
+
+# ============================================================
+# Query
+# ============================================================
+
+type Query {
+  # 单体查询
+  {{entityA}}(id: ID!): {{EntityA}}
+
+  # 列表查询（带过滤、排序、分页）
+  {{entityAs}}(
+    filter: {{EntityA}}Filter
+    orderBy: {{EntityA}}OrderBy
+    order: SortOrder = DESC
+    first: Int
+    after: String
+    last: Int
+    before: String
+  ): {{EntityA}}Connection!
+
+  # Node 查询（全局 ID 解析）
+  node(id: ID!): Node
+}
+
+input {{EntityA}}OrderBy {
+  field: {{EntityA}}OrderField!
+}
+
+enum {{EntityA}}OrderField {
+  CREATED_AT
+  UPDATED_AT
+}
+
+# ============================================================
+# Mutations
+# ============================================================
+
+type Mutation {
+  create{{EntityA}}(input: Create{{EntityA}}Input!): Create{{EntityA}}Payload!
+  update{{EntityA}}(input: Update{{EntityA}}Input!): Update{{EntityA}}Payload!
+  delete{{EntityA}}(input: Delete{{EntityA}}Input!): Delete{{EntityA}}Payload!
+}
+
+type Create{{EntityA}}Payload {
+  {{entityA}}: {{EntityA}}!
+}
+
+type Update{{EntityA}}Payload {
+  {{entityA}}: {{EntityA}}!
+}
+
+input Delete{{EntityA}}Input {
+  id: ID!
+}
+
+type Delete{{EntityA}}Payload {
+  deletedId: ID!
+}
+
+# ============================================================
+# Subscriptions
+# ============================================================
+
+type Subscription {
+  {{entityA}}Created: {{EntityA}}!
+  {{entityA}}Updated: {{EntityA}}!
+  {{entityA}}Deleted: ID!
+}
+
+# ============================================================
+# Directives
+# ============================================================
+
+directive @auth(requires: [Role!]!) on FIELD_DEFINITION | OBJECT
+directive @deprecated(reason: String!) on FIELD_DEFINITION | ENUM_VALUE
+
+enum Role {
+  ADMIN
+  USER
+  ANONYMOUS
+}
+
+# ============================================================
+# Errors
+# ============================================================
+
+# 遵循 GraphQL Spec: errors 数组在响应体中返回
+# 统一错误码扩展：
+#
+#   extensions:
+#     code: NOT_FOUND | UNAUTHORIZED | FORBIDDEN | VALIDATION_ERROR | INTERNAL_ERROR
+#     details: "..."
