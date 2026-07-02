@@ -806,13 +806,13 @@ sequenceDiagram
 
 ### 6.1 云端服务职责
 
-| 服务 | 职责 | 技术选型（建议） |
-|------|------|----------------|
-| **Sync API** | 处理同步 Push/Pull 请求、变更日志存储、冲突辅助裁决 | Go / FastAPI + PostgreSQL |
-| **Auth Service** | OAuth 2.0 认证（Google/Apple/Email）、Token 管理、会话维护 | Auth0 / Firebase Auth / 自建 |
-| **Object Storage** | 附件存储、备份存储 | AWS S3 / Cloudflare R2 / 阿里云 OSS |
-| **Change Log DB** | 持久化存储所有用户变更日志 | PostgreSQL |
-| **User DB** | 用户账户、订阅信息 | PostgreSQL |
+| 服务 | 职责 | 技术选型 |
+|------|------|---------|
+| **Sync API** | 处理同步 Push/Pull 请求、变更日志存储、冲突辅助裁决 | Render（Go） |
+| **Auth Service** | OAuth 2.0 认证（Google/Apple/Email）、Token 管理、会话维护 | Supabase Auth |
+| **Object Storage** | 附件存储、备份存储 | Supabase Storage |
+| **Change Log DB** | 持久化存储所有用户变更日志 | Supabase（PostgreSQL） |
+| **User DB** | 用户账户、订阅信息 | Supabase（PostgreSQL） |
 
 ### 6.2 云端数据模型（简化）
 
